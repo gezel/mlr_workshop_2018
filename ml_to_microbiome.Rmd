@@ -1,0 +1,459 @@
+---
+title: "Application of machine learning to microbiome data"
+output:
+   BiocStyle::html_document:
+      toc: true
+      df_print: paged
+      self_contained: true
+      code_download: true
+      highlight: tango
+author: "Jakob Wirbel & Georg Zeller"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r style, echo=FALSE, results="asis", cache=FALSE}
+library("knitr")
+options(digits = 2, width = 80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo = TRUE, tidy = FALSE, include = TRUE,
+               dev=c('png', 'pdf', 'svg'), fig.height = 5, 
+               fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+cache = TRUE)
+```
+
+**LAST UPDATED**
+
+```{r, echo=FALSE, cache=FALSE}
+print(format(Sys.time(), "%b %d %Y"))
+```
+
+
+# Preparations
+
+We first set global chunk options and load the
+necessary packages.
+
+```{r setup, cache = FALSE, message=FALSE}
+library("rmarkdown")
+library("BiocStyle")
+library("mlr")
+library("pROC")
+library("ggplot2")
+
+set.seed(2018)
+```
+
+
+# Introduction
+
+This tutorial aims at illustrating how machine learning methods can be applied
+to associate gut microbiome composition (that is abundance profiles of various
+microbial species dwelling in our guts) with properties of the host. This is
+an area of intense research with pomising reports for many human disorders as
+illutrated by the figure.
+
+![](/Users/zeller/teaching/2018/mlr_workshop_2018-06/gut_microbiome_disease_V.png)
+
+In the following, we will train classifiers to recognize colorectal cancer
+based on the microbial composition of stool samples. For this we use data from
+[Zeller et al. Mol Syst Biol., 2014](http://onlinelibrary.wiley.com/doi/10.15252/msb.20145645/abstract), 
+where the context and motivation is also explained in more detail.
+
+There are two major reasons motivating the application of machine learning to
+this kind of data:
+
+- We are  able to evaluate the accuracy of the trained models and we can 
+  make predictions on future data (generated in a similar manner). This can 
+  form the basis for developing microbiome-based clinical tests (e.g. for
+  population screening in early cancer detection prgrams). Knowing the
+  prediction accuracy is in this context more relevant than statistical
+  significance.
+- In contrast to "black box" models, interpretable machine learning models 
+  are generally useful for biomarker discovery (and are used as such in many
+  other life science applications, e.g. in genomics, transcriptomics, ...).
+
+# Data preprocessing
+
+This part illustrates the microbiome-specific data preprocessing pipeline and
+might be of interest, but it is not crucial from a machine-learning centric
+point of view.
+
+In short, the microbiome abundance profiles are converted into relative 
+abundances and then normalized to reduce heteroscedasticity.
+
+## Loading the data
+
+```{r}
+# this is data from Zeller et al., Mol. Syst. Biol. 2014
+fn.feat <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_tax-ab-specI.tsv'
+fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_metadata.tsv'
+
+# load patient data and convert the group column into a label vector
+meta <- read.table(fn.metadata, quote='', sep='\t', header=TRUE,
+                   row.names=1, check.names=FALSE)
+
+head(meta)
+
+# create the label
+label <- as.numeric(as.factor(meta$Group))
+names(label) <- rownames(meta)
+label[label == 2] <- -1
+label <- as.factor(label)
+
+# read feature matrix
+feat <- read.table(fn.feat, quote='', sep='\t', header=TRUE, row.names=1,
+                   check.names=FALSE)
+feat <- as.matrix(feat)
+feat[1:5, 1:5]
+
+# assert correspondence between featrue and label data
+stopifnot(all(names(label) == colnames(feat)))
+
+cat('Loaded data: n=', ncol(feat), ' observations (samples), each with p=', 
+    nrow(feat), ' variables (features).\n', sep='')
+```
+
+## Library size scaling
+
+```{r}
+# library sizes
+options(repr.plot.width=5, repr.plot.height=5)
+hist(colSums(feat), 30, col='slategray', 
+     main='Library Size Histogram', xlab='Library Size')
+```
+
+The above plots strongly suggests to correct for differences in library size
+(i.e. the number of sequencing reads generated for each sample). Here we use
+the simplest approach: conversion to relative abundances (also known as total
+sum scaling).
+
+```{r}
+# conversion to relative abundances (perhaps the library size normalization)
+feat.rel <- prop.table(feat, 2)
+
+cat('Converted read count data to relative abundances.\n')
+```
+
+## Low abundance filtering
+
+Secondly, we discard feature with very low abundance in all samples. This is 
+a heuristic motivated by the common believe that these are unlikely to play 
+a major role in the gut ecosystem (they could be transient bacteria taken up
+with food rather than colonizers of the human gut) and their quantification 
+has the greatest uncertainty.
+
+```{r}
+# unsupervised feature filtering
+abundance.cutoff <- 1E-3
+f.max <- apply(feat.rel, 1, max)
+f.idx <- which(f.max >= abundance.cutoff)
+cat('Number of features before filtering:', nrow(feat.rel), '\n')
+feat.filtered <- feat.rel[f.idx,]
+
+# remove the feature that corresponds to reads 
+#   that could not be mapped to any species
+if (rownames(feat.filtered)[1] == 'UNMAPPED' || rownames(feat.filtered)[1] == '-1') {
+  feat.filtered <- feat.filtered[-1,]
+}
+cat('Number of features after filtering:', nrow(feat.filtered), '\n')
+```
+
+## Normalization
+
+Here, we use a logarithm transformation to approximately stabilize the
+variance and reduce emphasis of changes in the most abundant features. There
+is many other alternative approaches that could make sense here but
+importantly we do not make use of any label information (patient status) here,
+and can thus apply these up front to the whole data set (and outside of the
+following cross validation).
+
+```{r}
+norm.features <- function(feat, n0=1E-6){
+    # logarithmic transformation followed by standardization
+    feat <- log10(feat + n0)
+    m <- apply(feat, 1, mean)
+    s <- apply(feat, 1, sd)
+    for (r in 1:nrow(feat)) {
+      feat[r,] <- (feat[r,] - m[r]) / s[r]
+    }
+    ret <- list(feat=feat, mean=m, sd=s, n0=n0)
+    return(ret)
+}
+
+norm.par <- norm.features(feat.filtered)
+feat.norm <- norm.par$feat
+
+## change the feature names in order to comply with mlr prerequisites
+rownames(feat.norm) <- make.names(rownames(feat.norm))
+
+```
+
+# The classification problem
+
+After these preprocessing steps, our dataset now consists of normalized gut 
+microbiome profiles (i.e. the features) from healthy controls and from CRC
+patients, clinical (meta-)data for each sample, and the label (a vector
+containing the response variable, where +1 indicates a CRC case, and -1 a
+control).
+
+Several studies have found bacteria associated with colonic cancer tissue.
+For example [Kostic et al.](https://europepmc.org/abstract/MED/22009990) and
+also [Castellarin et al.](https://europepmc.org/abstract/MED/22009989)
+detected higher abundance of _Fusobacterium nucleatum_ in CRC patients. 
+Let us see if we can see a similar pattern in our data (from stool samples):
+
+```{r}
+df.plot <- data.frame(fuso=feat['Fusobacterium nucleatum [Cluster1479]',],
+                      group=meta$Group)
+# re-order
+df.plot$group <- factor(df.plot$group, levels = c('CTR', 'CRC'))
+
+ggplot(df.plot, aes(x=group, y=log10(fuso+1), fill=group)) +
+  geom_boxplot() + 
+  theme_classic() + 
+  xlab('') + ylab('log10(Abundance)') + 
+  ggtitle('Fusobacterium nucleatum') + 
+  scale_fill_manual(values=c('lightgrey', 'tomato'))
+```
+
+This looks good enough to try and build a machine learning model that is able
+to predict the cancer status from the normalized species abundance features.
+
+
+# Building a LASSO classifier
+
+## Preparing cross validation
+
+We will use the function below to partition data into cross validation folds.
+
+```{r}
+# this function returns a subset identifier for each example drawn at random 
+# from [1, num.folds]
+# use num.folds=10 for ten-fold cross validation
+partition.data <- function(label, num.folds=10) {
+  
+  fold.id <- rep(0, length(label))
+  fold.id <- sample(rep(1:num.folds, length.out=length(label)))
+  
+  stopifnot(all(fold.id > 0))
+  stopifnot(length(label) == length(fold.id))
+  
+  return(fold.id)
+}
+
+num.folds <- 5
+fold.id <- partition.data(label, num.folds=num.folds)
+cat('Prepared', num.folds, 'folds for cross validation.\n')
+print(table(label, fold.id))
+```
+
+## Creating LASSO learner
+
+Since we want to use LASSO regression, we have to prepare the respective `mlr`
+learner. Here, we use the learner provided through the package `glmnet`.
+
+The same learner can also be used for Ridge regression or Elastic Net 
+regression, as controlled by the hyperparamter `alpha`. For LASSO regression, 
+`alpha` has to be set to `1`.
+
+```{r}
+lrn.lasso <- makeLearner("classif.cvglmnet", predict.type = "prob", "alpha" = 1)
+```
+
+```{r}
+# you could have a look at the learner and its parameters
+# lrn.lasso
+# lrn.lasso$par.set
+```
+
+
+## Training the model
+
+For the sake of demonstration we implement our own cross-validation scheme
+here, where we define a separate `mlr` training and testing task in every
+cross-validation fold, on which we can then train the learner created above.
+In the exercises below we will try and simplify this code using `mlr`
+cpabilities for cross validation.
+
+```{r}
+# prepare to save the results
+# predictions
+predictions <- vector(mode='numeric', length = nrow(meta))
+names(predictions) <- rownames(meta)
+# feature weights
+feat.weights <- matrix(NA, nrow=nrow(feat.norm), ncol=num.folds, 
+                       dimnames = list(rownames(feat.norm), 
+                                       paste0('fold_', seq_len(num.folds))))
+
+start.time <- proc.time()[1]
+
+for (f in 1:num.folds){
+  test.idx <- which(fold.id==f)
+  train.idx <- setdiff(1:length(label), test.idx)
+    
+  # split the data
+  train.feat <- feat.norm[,train.idx]
+  train.label <- label[train.idx]
+  test.feat <- feat.norm[,test.idx]
+  test.label <- label[test.idx]
+        
+  # create mlr Task
+  data.train <- data.frame(t(train.feat))
+  data.train$label <- train.label
+  data.test <- data.frame(t(test.feat))
+  data.test$label <- test.label
+    
+  train.task <- makeClassifTask(data=data.train, target='label')
+  test.task <- makeClassifTask(data=data.test, target='label')
+  
+  # train model
+  model <- train(learner=lrn.lasso, task=train.task)
+  
+  # save feature weights
+  feat.weights[,f] <- coef(model$learner.model)[-1]
+  
+  # make predictions on test set
+  pred <- predict(model, test.task)
+  predictions[test.idx] <- pred$data$prob.1
+}
+
+cat('Finished training models in ', proc.time()[1] - start.time, 's...', sep='')
+```
+
+
+# Model evaluation and interpretation
+
+## Evaluation
+
+To assess the performance of individual models, we will use Receiver Operating
+Characteristic curves (ROC curves). Importantly, it allows for joint 
+visualization of the many possible trade-offs between sensitivity and 
+specificity.
+
+The area under the ROC curve (AUC) is a useful summary statistic for binary 
+classifier performance with larger values indicating better performance.
+
+In the clinical setting, the fecal occult blood test (FOBT) is often used to 
+screen (fecal samples) for CRC. We do have the FOBT results for most of the
+patients in our metadata and can thus assess if our model performs better
+than this established clinical test for non-invasive cancer screening.
+
+```{r fig.asp=1}
+# plot ROC curve
+plot(NULL, type='n', xlim=c(1,0), ylim=c(0,1) ,
+     xlab='Specificity', ylab='Sensitivity', 
+     main='Model evaluation')
+abline(1,-1, lty=3)
+
+# microbiome model AUC
+auc.microbiome <- roc(predictor=predictions, response=label, 
+                      cases = 1, plot=TRUE, add=TRUE, col='#4daf4a')$auc
+
+
+# get FOBT information into numeric form
+fobt <- as.numeric(meta$FOBT)
+auc.fobt <- roc(predictor=fobt, response=label, 
+                cases = 1, plot=TRUE, add=TRUE, col='#377eb8')$auc
+
+# legend
+legend('bottomright', 
+       legend=paste0(c('LASSO ROC: ', 'FOBT ROC: '), 
+                     formatC(c(auc.microbiome, auc.fobt), digits = 3)),
+       col=c('#4daf4a', '#377eb8'), lty=1, lwd=2)
+
+```
+
+
+## Interpretation
+
+Below we visualize the feature weights for the LASSO model. For simplicity, we
+average the coefficients across cross-validation folds (but one could also 
+use, e.g., the median and additionally visualize their variance across
+models).
+
+```{r}
+# take the means of the feature weights
+feat.weights.mean <- rowMeans(feat.weights)
+
+# extract some of the top features
+n.top <- 5
+top.feat <- which(rank(abs(feat.weights.mean)) > nrow(feat.norm) - n.top)
+
+# set right margin to be bigger
+par(mar=c(5,5,1,10))
+plot(feat.weights.mean, 1:nrow(feat.norm), 
+     pch=18, xlab='Mean feature weight', 
+     ylab='Microbial marker species', 
+     yaxt='n', col='slategrey')
+abline(v=0, col='gray80')
+
+# label top features
+for (h in top.feat) {
+  abline(h=h, col='gray80')
+  mtext(rownames(feat.norm)[h], side=4, 
+        at=h, las=2, cex=0.5, line=0.3)
+}
+
+```
+
+
+# Exercises and possible extensions
+
+1. Instead of the hand-written CV above, use mlr capabilities to
+   achieve the same. Use stratified CV to see whether this reduces the
+   variation seen between different folds and explore different performance 
+   measures.
+2. Use another machine learning method from `mlr`, e.g. Random
+   Forests or Ridge regression, instead of the LASSO and compare how well 
+   the different models perform.
+3. The model based on microbiome data seems to perform better than
+   the FOBT test. Have a look into `pROC`'s capabilities of plotting
+   confidence intervals around ROC curves and statistical tests for comparing
+   them. Is the area under ROC curve a resonably summary statistic for the
+   FOBT performance? Check if the sensitivity of the microbiome-based model is
+   significantly better than that of the FOBT test at the same specificity.
+4. Apply the trained models to external (holdout test) data, 
+   i.e. the CN-CRC data set (see below) and evaluate the accuracy.
+   This should be straightforward with the provided data preprocessing
+   pipeline (Note however that ideally, the new data set should be normalized
+   in the same way as the cross-validation data -- this type of 'frozen
+   normalization' requires saving and re-using the original normalization
+   parameters).
+5. [Bio] Run the above workflow on both the FR-CRC and the CN-CRC data sets 
+   and compare the top feature weights, e.g. the robustness of these as 
+   biomarkers for colorectal cancer.
+
+A similar dataset of CRC patients and healthy controls is available here:
+```{r}
+# this is the external dataset from Feng et al., Nat. Commun. 2015
+fn.feat.cn <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_tax-ab-specI.tsv'
+fn.metadata.cn <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_metadata.tsv'
+
+
+meta.cn <- read.table(fn.metadata.cn, quote='', sep='\t', header=TRUE,
+                      row.names=1, check.names=FALSE)
+
+head(meta.cn)
+
+# create the label
+label.cn <- as.numeric(as.factor(meta.cn$Group))
+names(label.cn) <- rownames(meta.cn)
+label.cn[label.cn == 2] <- -1
+label.cn <- as.factor(label.cn)
+
+# read feature matrix
+feat.cn <- read.table(fn.feat.cn, quote='', sep='\t', header=TRUE,
+                      row.names=1, check.names=FALSE)
+feat.cn <- as.matrix(feat.cn)
+feat.rel.cn <- prop.table(feat.cn, 2)
+
+```
+
+
+# Session information
+
+```{r cache=FALSE}
+sessionInfo()
+```
+
